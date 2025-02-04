@@ -89,7 +89,7 @@ void yuyv_to_rgb(unsigned char *yuyv, unsigned char *rgb, int width, int height)
 }
 
 /**
- * @brief Function that consumes the frames from the shared buffer and saves them on the disk (raw)
+ * @brief Function that consumes the frames from the shared buffer and saves them on the disk
  * @param 
  * @return
  */
@@ -162,6 +162,10 @@ static void frame_producer(){
     int status;
     struct v4l2_buffer buf;    // buffer structure
 
+    memset(&buf, 0, sizeof(buf));
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     // start the streaming
     if(ioctl(vd, VIDIOC_STREAMON, &type) == -1){
@@ -174,13 +178,10 @@ static void frame_producer(){
     // loop until the timer expires
     while(difftime(time(0), start) < timer){
 
-        memset(&buf, 0, sizeof(buf));
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-
+        // extract the frame from the buffer
         if(ioctl(vd, VIDIOC_DQBUF, &buf) == -1){
             perror("Dequeue buffer error");
-            exit(EXIT_FAILURE);
+            continue;
         }
 
         // check if there is room to store the frame
@@ -189,7 +190,7 @@ static void frame_producer(){
             // no room available
             perror("Buffer is full\n");
             sem_post(&sharedBuf->mutex);
-            exit(EXIT_FAILURE);
+            continue;   // restart
         }
         sem_post(&sharedBuf->mutex);
 
@@ -203,9 +204,10 @@ static void frame_producer(){
         // exit critical section
         sem_post(&sharedBuf->mutex);
 
+        // re-enqueue the buffer
         if(ioctl(vd, VIDIOC_QBUF, &buf) == -1){
             perror("Queue buffer error");
-            exit(EXIT_FAILURE);
+            continue;
         }
     }
 
