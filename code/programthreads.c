@@ -22,7 +22,7 @@
 
 #define DEVICE "/dev/video0"
 #define BUFFER_SIZE 100
-#define BUFFER_DIM 50
+#define BUFFER_DIM 30
 
 #define CLIP(value) ((value) < 0 ? 0 : ((value) > 255 ? 255 : (value)))
 
@@ -32,8 +32,8 @@ pthread_mutex_t frame_numb_mutex;               // semaphore for the frame numbe
 pthread_mutex_t video_buffer_mutex;             // semaphore for the video buffer
 pthread_cond_t roomAvailable, dataAvailable;    // condition variables to signal availability of room and data in the buffer
 
-void * buffer_ptrs[BUFFER_DIM];         // array of pointers to the buffers
-size_t buffer_lengths[BUFFER_DIM];      // array of lengths of the buffers
+unsigned char * buffer_ptrs[BUFFER_DIM];        // array of pointers to the buffers
+size_t buffer_lengths[BUFFER_DIM];              // array of lengths of the buffers
 
 /**
  * @brief Structure that defines the buffer to store the frames
@@ -64,37 +64,6 @@ time_t start;
 struct BufferData * sharedBuf;      // shared buffer
 
 /**
- * @brief Function that convert the YUYV format into RGB
- * @param yuyv pointer to the YUYV frame
- * @param rgb pointer to the RGB frame
- * @param width width of the frame
- * @param height height of the frame
- * @return
- */
-void yuyv_to_rgb(unsigned char *yuyv, unsigned char *rgb, int width, int height) {
-    int pixel_count = width * height;
-    for (int i = 0, j = 0; i < pixel_count * 2; i += 4, j += 6) {
-        int Y1 = yuyv[i];
-        int U  = yuyv[i + 1];
-        int Y2 = yuyv[i + 2];
-        int V  = yuyv[i + 3];
-
-        int C1 = Y1 - 16;
-        int C2 = Y2 - 16;
-        int D  = U - 128;
-        int E  = V - 128;
-
-        rgb[j] = CLIP((298 * C1 + 409 * E + 128) >> 8);                     // R1
-        rgb[j + 1] = CLIP((298 * C1 - 100 * D - 208 * E + 128) >> 8);       // G1
-        rgb[j + 2] = CLIP((298 * C1 + 516 * D + 128) >> 8);                 // B1
-
-        rgb[j + 3] = CLIP((298 * C2 + 409 * E + 128) >> 8);                 // R2
-        rgb[j + 4] = CLIP((298 * C2 - 100 * D - 208 * E + 128) >> 8);       // G2
-        rgb[j + 5] = CLIP((298 * C2 + 516 * D + 128) >> 8);                 // B2
-    }
-}
-
-/**
  * @brief Function that consumes the frames from the buffer and saves them on the disk
  * @param arg argument
  * @return
@@ -123,9 +92,7 @@ static void * frame_consumer(void * arg){
         }
         
         unsigned char frame [sharedBuf->frame_size];
-        strcpy(type, sharedBuf->format);
-        int h = sharedBuf->height;
-        int w = sharedBuf->width;
+        strncpy(type, sharedBuf->format, 4);
         //collect the frame from the buffer
         memcpy(frame, &sharedBuf->buffer[sharedBuf->head * sharedBuf->frame_size], sharedBuf->frame_size);
         sharedBuf->head = (sharedBuf->head + 1) % BUFFER_SIZE;      // circular array
@@ -140,26 +107,16 @@ static void * frame_consumer(void * arg){
         pthread_mutex_unlock(&frame_numb_mutex);
 
         if(strncmp(type, "YUYV", 4) == 0){
-            sprintf(filename, "frame/converted_frame_%d.jpg", frame_numb);        // save the frame in .jpg
-            // convert the YUYV into RGB
-            unsigned char rgb_frame[ w * h * 3];
-            yuyv_to_rgb(frame, rgb_frame, w, h);
-            FILE * frame_file = fopen(filename, "wb");
-            if(frame_file){
-                fwrite(rgb_frame, 1, sizeof(rgb_frame), frame_file);
-                fclose(frame_file);
-            }else{
-                perror("Error saving the frame\n");
-            }
+            sprintf(filename, "frame/frame_%d.raw", frame_numb);        // save the frame in .raw
         }else{
             sprintf(filename, "frame/frame_%d.jpg", frame_numb);        // save the frame in .jpg
-            FILE * frame_file = fopen(filename, "wb");
-            if(frame_file){
-                fwrite(frame, 1, sizeof(frame), frame_file);
-                fclose(frame_file);
-            }else{
-                perror("Error saving the frame\n");
-            }
+        }
+        FILE * frame_file = fopen(filename, "wb");
+        if(frame_file){
+            fwrite(frame, 1, sizeof(frame), frame_file);
+            fclose(frame_file);
+        }else{
+            perror("Error saving the frame\n");
         }
     }
 }
@@ -175,7 +132,7 @@ static void * frame_producer(void * arg){
 
     memset(&buf, 0, sizeof(buf));
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
+    buf.memory = V4L2_MEMORY_USERPTR;
 
     // loop until the timer expires
     while(difftime(time(0), start) < timer){
@@ -218,7 +175,6 @@ static void * frame_producer(void * arg){
 
     pthread_mutex_lock(&fin_mutex);
     finish --;      // one producer has finished
-    printf("Producer finished: %d\n", finish);
     pthread_mutex_unlock(&fin_mutex);
 
     pthread_cond_broadcast(&dataAvailable);    // wake up ALL threads
@@ -344,12 +300,7 @@ int main(int argc, char **argv){
 
     height = fmt.fmt.pix.height;
     width = fmt.fmt.pix.width;
-
-    if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV){
-        frame_size = height * width * 2;    // 2 bytes for each pixel
-    }else if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG){
-        frame_size = height * width * 3;    // 3 bytes for each pixel
-    }
+    frame_size = (unsigned int)fmt.fmt.pix.sizeimage;
 
     printf("Frame Size: %d\n", frame_size);
 
@@ -359,7 +310,7 @@ int main(int argc, char **argv){
     memset(&req, 0, sizeof(req));               // set to 0 the structure
     req.count = BUFFER_DIM;                     // set the number of buffers
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;     // set the type of buffer (video capture)
-    req.memory = V4L2_MEMORY_MMAP;              // set the memory type (mmap, direct access in memory)
+    req.memory = V4L2_MEMORY_USERPTR;           // set the memory type (user memory)
 
     // check if the request is accepted
     if(ioctl(vd, VIDIOC_REQBUFS, &req) == -1){
@@ -367,28 +318,33 @@ int main(int argc, char **argv){
         exit(EXIT_FAILURE);
     }
 
+    // check if the buffer is accepted
+    if(req.count < BUFFER_DIM){
+        printf("Buffer allocation reduced to %d\n", req.count);
+    }else{
+        printf("Buffer allocation of %d accepted\n", req.count);
+    }
+
+    // allocate buffer in user memory
+    for (int i = 0; i < req.count; i++) {
+        buffer_ptrs[i] = malloc(frame_size);
+        if (!buffer_ptrs[i]) {
+            perror("Failed to allocate user buffer");
+            exit(EXIT_FAILURE);
+        }
+        buffer_lengths[i] = frame_size;
+    }
+
+
     // configuration of the buffers
-    for(int i = 0; i < BUFFER_DIM; i++){
+    for(int i = 0; i < req.count; i++){
 
         memset(&buf, 0, sizeof(buf));               // set to 0 the structure
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;     // set the type of buffer (video capture)
-        buf.memory = V4L2_MEMORY_MMAP;              // set the memory type (mmap, direct access in memory)
+        buf.memory = V4L2_MEMORY_USERPTR;           // set the memory type (mmap, direct access in memory)
         buf.index = i;                              // set the index of the buffer
-
-        // check if the buffer is accepted
-        if(ioctl(vd, VIDIOC_QUERYBUF, &buf) == -1){
-            perror("VIDIOC_QUERYBUF error");
-            exit(EXIT_FAILURE);
-        }
-
-        // map the buffer in memory (mmap)
-        buffer_ptrs[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, vd, buf.m.offset);
-        if(buffer_ptrs[i] == MAP_FAILED){
-            perror("MMAP failure");
-            exit(EXIT_FAILURE);
-        }
-
-        buffer_lengths[i] = buf.length;             // set the length of the buffer
+        buf.m.userptr = (unsigned long)buffer_ptrs[i];
+        buf.length = buffer_lengths[i];
 
         // enqueue the buffer
         if(ioctl(vd, VIDIOC_QBUF, &buf) == -1){
@@ -454,8 +410,8 @@ int main(int argc, char **argv){
 
     // free memory
     free(sharedBuf);
-    for(int i = 0; i < BUFFER_DIM; i++){
-        munmap(buffer_ptrs[i], buffer_lengths[i]);
+    for(int i = 0; i < req.count; i++){
+        free(buffer_ptrs[i]);
     }
    
     // close the device (videocamera)

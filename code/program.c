@@ -28,8 +28,6 @@
 #define SHARED_MEMORY_NAME "/shared_buffer"         // shared buffer
 #define SHARED_FINISHED_CONDITION "/shared_finish"  //finish condition
 
-#define CLIP(value) ((value) < 0 ? 0 : ((value) > 255 ? 255 : (value)))
-
 struct BufferData {
     int head;                   // head of the buffer
     int tail;                   // tail of the buffer
@@ -58,37 +56,6 @@ finish_t * sharedFin;
 int vd, timer;
 
 /**
- * @brief Function that convert the YUYV format into RGB
- * @param yuyv pointer to the YUYV frame
- * @param rgb pointer to the RGB frame
- * @param width width of the frame
- * @param height height of the frame
- * @return
- */
-void yuyv_to_rgb(unsigned char *yuyv, unsigned char *rgb, int width, int height) {
-    int pixel_count = width * height;
-    for (int i = 0, j = 0; i < pixel_count * 2; i += 4, j += 6) {
-        int Y1 = yuyv[i];
-        int U  = yuyv[i + 1];
-        int Y2 = yuyv[i + 2];
-        int V  = yuyv[i + 3];
-
-        int C1 = Y1 - 16;
-        int C2 = Y2 - 16;
-        int D  = U - 128;
-        int E  = V - 128;
-
-        rgb[j] = CLIP((298 * C1 + 409 * E + 128) >> 8);                     // R1
-        rgb[j + 1] = CLIP((298 * C1 - 100 * D - 208 * E + 128) >> 8);       // G1
-        rgb[j + 2] = CLIP((298 * C1 + 516 * D + 128) >> 8);                 // B1
-
-        rgb[j + 3] = CLIP((298 * C2 + 409 * E + 128) >> 8);                 // R2
-        rgb[j + 4] = CLIP((298 * C2 - 100 * D - 208 * E + 128) >> 8);       // G2
-        rgb[j + 5] = CLIP((298 * C2 + 516 * D + 128) >> 8);                 // B2
-    }
-}
-
-/**
  * @brief Function that consumes the frames from the shared buffer and saves them on the disk
  * @param 
  * @return
@@ -114,9 +81,7 @@ static void frame_consumer(){
         sem_post(&sharedFin->mutex);
 
         unsigned char frame [sharedBuf->frame_size];
-        strcpy(type, sharedBuf->format);
-        int h = sharedBuf->height;
-        int w = sharedBuf->width;
+        strncpy(type, sharedBuf->format, 4);
         //collect the frame from the buffer
         memcpy(frame, &sharedBuf->buffer[sharedBuf->head * sharedBuf->frame_size], sharedBuf->frame_size);
         sharedBuf->head = (sharedBuf->head + 1) % BUFFER_SIZE;      // circular array
@@ -126,27 +91,18 @@ static void frame_consumer(){
 
         // save the frame in the disk (folder frame)
         if(strncmp(type, "YUYV", 4) == 0){
-            sprintf(filename, "frame/converted_frame_%d.jpg", frame_numb);        // save the frame in .jpg
-            // convert the YUYV into RGB
-            unsigned char rgb_frame[ w * h * 3];
-            yuyv_to_rgb(frame, rgb_frame, w, h);
-            FILE * frame_file = fopen(filename, "wb");
-            if(frame_file){
-                fwrite(rgb_frame, 1, sizeof(rgb_frame), frame_file);
-                fclose(frame_file);
-            }else{
-                perror("Error saving the frame\n");
-            }
+            sprintf(filename, "frame/frame_%d.raw", frame_numb);        // save the frame in .raw
         }else{
             sprintf(filename, "frame/frame_%d.jpg", frame_numb);        // save the frame in .jpg
-            FILE * frame_file = fopen(filename, "wb");
-            if(frame_file){
-                fwrite(frame, 1, sizeof(frame), frame_file);
-                fclose(frame_file);
-            }else{
-                perror("Error saving the frame\n");
-            }
         }
+        FILE * frame_file = fopen(filename, "wb");
+        if(frame_file){
+            fwrite(frame, 1, sizeof(frame), frame_file);
+            fclose(frame_file);
+        }else{
+            perror("Error saving the frame\n");
+        }
+
         frame_numb++;
 
     }
@@ -169,7 +125,7 @@ static void frame_producer(){
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     // start the streaming
     if(ioctl(vd, VIDIOC_STREAMON, &type) == -1){
-        perror("Errore avvio streaming");
+        perror("Start streaming error");
         exit(EXIT_FAILURE);
     }
 
@@ -213,7 +169,7 @@ static void frame_producer(){
 
     // stop streaming
     if(ioctl(vd, VIDIOC_STREAMOFF, &type) == -1){
-        perror("Errore stop streaming");
+        perror("Stop streaming error");
         exit(EXIT_FAILURE);
     }
 
@@ -333,12 +289,7 @@ int main(int argc, char **argv){
     // dim
     height = fmt.fmt.pix.height;
     width = fmt.fmt.pix.width;
-
-    if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV){
-        frame_size = height * width * 2;    // 2 bytes for each pixel
-    }else if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG){
-        frame_size = height * width * 3;    // 3 bytes for each pixel
-    }
+    frame_size = (unsigned int)fmt.fmt.pix.sizeimage;
 
     printf("Frame Size: %d\n", frame_size);
 
@@ -355,7 +306,7 @@ int main(int argc, char **argv){
 
     // check if I set the correct size of memory (= total_size)
     if(ftruncate(memsh, total_size) == -1){
-        perror("Errore ftruncate");
+        perror("ftruncate error");
         exit(EXIT_FAILURE);
     }
 
@@ -436,7 +387,7 @@ int main(int argc, char **argv){
 
     // check if I set the correct size of memory (= total_size)
     if(ftruncate(fin, sizeof(finish_t)) == -1){
-        perror("Errore ftruncate");
+        perror("ftruncate error");
         exit(EXIT_FAILURE);
     }
 
@@ -456,7 +407,7 @@ int main(int argc, char **argv){
     pid = fork();
 
     if(pid < 0){
-        perror("Error fork");
+        perror("fork error");
         exit(EXIT_FAILURE);
     }
     if(pid == 0){
