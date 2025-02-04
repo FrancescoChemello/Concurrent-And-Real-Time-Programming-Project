@@ -380,7 +380,7 @@ int main(int argc, char **argv){
     sem_init(&sharedBuf->data_avail, 1, 0);
     sem_init(&sharedBuf->room_avail, 1, BUFFER_SIZE);
 
-    printf("Memoria condivisa creata con frame_size = %d bytes\n", frame_size);
+    printf("Shared memory created with frame size = %d bytes\n", frame_size);
 
     // set the structure for the request
     memset(&req, 0, sizeof(req));               // set to 0 the structure
