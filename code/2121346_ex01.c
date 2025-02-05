@@ -14,49 +14,59 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/wait.h>
 #include <linux/videodev2.h>    // for v4l2
 #include <sys/ioctl.h>          // for input/output control
-#include <semaphore.h>          // to define semaphores
+#include <sys/ipc.h>            // for inter-process communication
+#include <sys/msg.h>            // for message queue
 #include <sys/mman.h>           // for memory map
 #include <time.h>               // for the timer
+#include <sys/wait.h>           // for waitpid
 
 #define DEVICE "/dev/video0"
 #define BUFFER_SIZE 100
 #define BUFFER_DIM 30
-// give a name to the shared memory -> identify the area
-#define SHARED_MEMORY_NAME "/shared_buffer"         // shared buffer
-#define SHARED_FINISHED_CONDITION "/shared_finish"  //finish condition
+#define PRODCONS_TYPE 1
 
-struct BufferData {
-    int head;                   // head of the buffer
-    int tail;                   // tail of the buffer
-    int height;                 // height of the frame
-    int width;                  // width of the frame
+struct msgframe{
+    long mtype;                 // message type (required for message queue)
     int frame_size;             // size of the frame
-    char format[4];             // the type (MJPG or YUYV)
-    sem_t mutex;                // semaphore to protect the shared buffer
-    sem_t data_avail;           // semaphore to signal that the buffer is empty
-    sem_t room_avail;           // semaphore to signal that the buffer is full
-    unsigned char buffer[];     // buffer to store the frames (in the end!)
+    char type[5];               // the type (MJPG or YUYV) or EOFT (End OF Transmission)
+    char shm_name[50];          // memory map name
 };
-
-typedef struct {
-    sem_t mutex;                // semaphore to protect the variable
-    char finish;                // char to signal the termination (0 = false, 1 = true)
-} finish_t;
 
 void *buffer_ptrs[BUFFER_DIM];          // array of pointers to the buffers
 size_t buffer_lengths[BUFFER_DIM];      // array of lengths of the buffers
 
-
-char * usage_string = "Usage: %s <format> <height> <width> <framerate> <timeout>\n";
-struct BufferData * sharedBuf;
-finish_t * sharedFin;
+char * usage_string = "Usage: %s <format> <height> <width> <framerate> <acquisitiontime>\n";
 int vd, timer;
+int msgId;      // message queue id
 
 /**
- * @brief Function that consumes the frames from the shared buffer and saves them on the disk
+ * @brief Function that frees the memory and closes the device
+ * @param
+ * @return
+ */
+void cleanup() {
+    // Free memory
+    for(int i = 0; i < BUFFER_DIM; i++){
+        if (buffer_ptrs[i] != MAP_FAILED && buffer_ptrs[i] != NULL) {
+            munmap(buffer_ptrs[i], buffer_lengths[i]);
+        }
+    }
+
+    // Close the device (videocamera)
+    if (vd != -1) {
+        close(vd);
+    }
+
+    // Remove the message queue
+    if (msgId != -1) {
+        msgctl(msgId, IPC_RMID, NULL);
+    }
+}
+
+/**
+ * @brief Function that consumes a frame and stores it in the disk
  * @param 
  * @return
  */
@@ -65,71 +75,83 @@ static void frame_consumer(){
     char type[4];
     char filename[20];
     int frame_numb = 0;
+    struct msgframe msg;
+    int recv;
 
     while(1){
 
-        sem_wait(&sharedBuf->data_avail);
-        // enter critical section
-        sem_wait(&sharedBuf->mutex);
-        
-        //termination condition
-        sem_wait(&sharedFin->mutex);
-        if(sharedFin->finish == 1 && (sharedBuf->head == sharedBuf->tail)){
-            sem_post(&sharedFin->mutex);
-            return;
-        }
-        sem_post(&sharedFin->mutex);
+        // receive the message
+        recv = msgrcv(msgId, &msg, sizeof(msg), 0, 0);
 
-        unsigned char frame [sharedBuf->frame_size];
-        strncpy(type, sharedBuf->format, 4);
-        //collect the frame from the buffer
-        memcpy(frame, &sharedBuf->buffer[sharedBuf->head * sharedBuf->frame_size], sharedBuf->frame_size);
-        sharedBuf->head = (sharedBuf->head + 1) % BUFFER_SIZE;      // circular array
-        sem_post(&sharedBuf->room_avail);
-        // exit critical section
-        sem_post(&sharedBuf->mutex);
+        if(recv == -1){
+            perror("Error receiving message");
+            continue;
+        }
+
+        // ending condition
+        if (strcmp(msg.type, "EOFT") == 0){
+            break;      // End OF Transmission message received
+        }
+
+        // process the frame
+        int shm_fd = shm_open(msg.shm_name, O_RDONLY, 0666);
+        unsigned char * frame = mmap(NULL, msg.frame_size, PROT_READ, MAP_SHARED, shm_fd, 0);
+        
+        // check if the memory map is created
+        if (frame == MAP_FAILED) {
+            perror("MMAP error");
+            cleanup();
+            exit(EXIT_FAILURE);
+        }
 
         // save the frame in the disk (folder frame)
-        if(strncmp(type, "YUYV", 4) == 0){
+        if(strncmp(msg.type, "YUYV", 4) == 0){
             sprintf(filename, "frame/frame_%d.raw", frame_numb);        // save the frame in .raw
         }else{
             sprintf(filename, "frame/frame_%d.jpg", frame_numb);        // save the frame in .jpg
         }
         FILE * frame_file = fopen(filename, "wb");
         if(frame_file){
-            fwrite(frame, 1, sizeof(frame), frame_file);
+            fwrite(frame, 1, msg.frame_size, frame_file);
             fclose(frame_file);
         }else{
             perror("Error saving the frame\n");
         }
-
         frame_numb++;
 
+        // free memory map
+        munmap(frame, msg.frame_size);
+        shm_unlink(msg.shm_name);
     }
 }
 
 /**
- * @brief Function that produces the frames from the webcam and stores them in the shared buffer (mmap)
- * @param
+ * @brief Function that produces a frame and sends it to the consumer
+ * @param frame_size size of the frame
+ * @param type type of the frame (MJPG or YUYV)
  * @return
  */
-static void frame_producer(){   
+static void frame_producer(int frame_size, char frtype[5]){   
 
-    int status;
-    struct v4l2_buffer buf;    // buffer structure
+    struct v4l2_buffer buf;     // buffer structure
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
     memset(&buf, 0, sizeof(buf));
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
-
-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    
     // start the streaming
     if(ioctl(vd, VIDIOC_STREAMON, &type) == -1){
         perror("Start streaming error");
+        cleanup();
         exit(EXIT_FAILURE);
     }
 
+    struct msgframe msg;        // message
+    msg.mtype = PRODCONS_TYPE;  // message type
+
     time_t start = time(0);    // get the current time
+    int frame_numb = 0;
 
     // loop until the timer expires
     while(difftime(time(0), start) < timer){
@@ -140,47 +162,67 @@ static void frame_producer(){
             continue;
         }
 
-        // check if there is room to store the frame
-        sem_wait(&sharedBuf->mutex);
-        if(sharedBuf->head == (sharedBuf->tail + 1) % BUFFER_SIZE){
-            // no room available
-            perror("Buffer is full\n");
-            sem_post(&sharedBuf->mutex);
-            continue;   // restart
+        // cration of memory map
+        sprintf(msg.shm_name, "/frame_%d", frame_numb);
+        
+        int memsh = shm_open(msg.shm_name, O_CREAT | O_RDWR, 0666);   
+        
+        if(memsh == -1){
+            perror("Shared memory creation failed");
+            continue;
         }
-        sem_post(&sharedBuf->mutex);
 
-        sem_wait(&sharedBuf->room_avail);
-        // enter critical section
-        sem_wait(&sharedBuf->mutex);
-        unsigned char * buf_frame = &sharedBuf->buffer[sharedBuf->tail * sharedBuf->frame_size];
-        memcpy(buf_frame, buffer_ptrs[buf.index], sharedBuf->frame_size);
-        sharedBuf->tail = (sharedBuf->tail + 1) % BUFFER_SIZE;
-        sem_post(&sharedBuf->data_avail);
-        // exit critical section
-        sem_post(&sharedBuf->mutex);
+        // check if I set the correct size of memory (= total_size)
+        if(ftruncate(memsh, frame_size) == -1){
+            perror("ftruncate error");
+            cleanup();
+            exit(EXIT_FAILURE);
+        }
+
+        unsigned char * mmap_frame = mmap(NULL, frame_size, PROT_READ | PROT_WRITE, MAP_SHARED, memsh, 0);
+
+        // check if I create the shared memory
+        if(mmap_frame == MAP_FAILED){
+            perror("Mmap failed");
+            continue;
+        }
+
+        // creation of the message
+
+        // copy the frame into the memory map
+        memcpy(mmap_frame, buffer_ptrs[buf.index], frame_size);
+        msg.frame_size = frame_size;
+        strncpy(msg.type, frtype, sizeof(msg.type));
+
+        
+        // send message to frame_consumer
+        if(msgsnd(msgId, &msg, sizeof(msg) - sizeof(long), 0) == -1){
+            perror("Error sending message");
+            continue;
+        }
 
         // re-enqueue the buffer
         if(ioctl(vd, VIDIOC_QBUF, &buf) == -1){
             perror("Queue buffer error");
             continue;
         }
+
+        frame_numb++;
     }
 
     // stop streaming
     if(ioctl(vd, VIDIOC_STREAMOFF, &type) == -1){
         perror("Stop streaming error");
+        cleanup();
         exit(EXIT_FAILURE);
     }
 
-    sem_wait(&sharedFin->mutex);
-    sharedFin->finish = 1;      // notify the consumer that the producer has finished
-    sem_post(&sharedFin->mutex);
+    // send the end of transmission message
+    strcpy(msg.type, "EOFT");
+    msg.frame_size = 0;
+    msgsnd(msgId, &msg, sizeof(msg) - sizeof(long), 0);
 
-    sem_wait(&sharedBuf->mutex);
-    sem_post(&sharedBuf->data_avail);
-    sem_post(&sharedBuf->mutex);
-
+    printf("Sent %d packets\n", frame_numb);
 }
 
 /**
@@ -191,6 +233,7 @@ static void frame_producer(){
 int main(int argc, char **argv){
     int status, memsh, fin;
     int frame_size, height, width;
+    char type [5];
     
     struct v4l2_capability cap;             // capability structure
     struct v4l2_format fmt;                 // format structure
@@ -203,18 +246,20 @@ int main(int argc, char **argv){
         exit(EXIT_FAILURE);
     }
 
-    printf("Format: %s - Height: %d - Width: %d - Frame Rate: %d - Timeout: %d\n", argv[1], atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]));
+    printf("Format: %s - Width: %d - Height: %d - Frame Rate: %d - Timeout: %d\n", argv[1], atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]));
 
     // check if it can be opened
     vd = open(DEVICE, O_RDWR);
     if(vd == -1){
         perror("Error opening device");
+        cleanup();
         exit(EXIT_FAILURE);
     }
 
     // check if it supports querying capabilities
     if(ioctl(vd, VIDIOC_QUERYCAP, &cap) == -1){
         perror("Error querying capability");
+        cleanup();
         exit(EXIT_FAILURE);
     }
 
@@ -222,6 +267,7 @@ int main(int argc, char **argv){
     if(!(cap.capabilities & V4L2_CAP_STREAMING))
     {
         printf("Streaming NOT supported\n");
+        cleanup();
         exit(EXIT_FAILURE);
     }
 
@@ -234,21 +280,25 @@ int main(int argc, char **argv){
     // setting the format
     if(!strcmp(argv[1],"MJPG") || !strcmp(argv[1],"mjpg")){
         fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+        strcpy(type, "MJPG\0");
     } else if (!strcmp(argv[1],"YUYV") || !strcmp(argv[1],"yuyv")){
         fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+        strcpy(type, "YUYV\0");
     } else {
         printf("Format %s not supported\n", argv[1]);
+        cleanup();
         exit(EXIT_FAILURE);
     }
 
     // setting the frame size
-    fmt.fmt.pix.height = atoi(argv[2]);
-    fmt.fmt.pix.width = atoi(argv[3]);
+    fmt.fmt.pix.width = atoi(argv[2]);
+    fmt.fmt.pix.height = atoi(argv[3]);
     fmt.fmt.pix.field = V4L2_FIELD_ANY;
 
     // check if it supports the format
     if(ioctl(vd, VIDIOC_S_FMT, &fmt) == -1){
         perror("Error setting format");
+        cleanup();
         exit(EXIT_FAILURE);
     }
 
@@ -260,6 +310,8 @@ int main(int argc, char **argv){
         (fmt.fmt.pix.pixelformat >> 24) & 0xFF,
         fmt.fmt.pix.width, fmt.fmt.pix.height);
 
+    frame_size = (unsigned int)fmt.fmt.pix.sizeimage;
+    
     // setting frame rate
     memset(&streamparm, 0, sizeof(streamparm));
     streamparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -269,6 +321,7 @@ int main(int argc, char **argv){
     // check if it supports the frame rate
     if(ioctl(vd, VIDIOC_S_PARM, &streamparm) == -1){
         perror("Error setting frame rate");
+        cleanup();
         exit(EXIT_FAILURE);
     }
 
@@ -279,69 +332,35 @@ int main(int argc, char **argv){
 
     // check the timeout value
     if(atoi(argv[5]) < 0){
-        printf("Timeout must be a positive value\n");
+        printf("Acquisition time must be a positive value\n");
+        cleanup();
         exit(EXIT_FAILURE);
     }else{
         printf("Timeout: %d\n", atoi(argv[5]));
         timer = atoi(argv[5]);
     }
 
-    // dim
-    height = fmt.fmt.pix.height;
-    width = fmt.fmt.pix.width;
-    frame_size = (unsigned int)fmt.fmt.pix.sizeimage;
+    // definition of the message
+    msgId = msgget(IPC_PRIVATE, 0666);
 
-    printf("Frame Size: %d\n", frame_size);
-
-    // definition of the buffer
-    int total_size = sizeof(struct BufferData) + (BUFFER_SIZE * frame_size);
-
-    memsh = shm_open(SHARED_MEMORY_NAME, O_CREAT | O_RDWR, 0666);
-
-    // check if I create the shared memory
-    if(memsh == -1){
-        perror("Shared memory creation failed");
+    if(msgId == -1){
+        perror("Error creating the message queue");
+        cleanup();
         exit(EXIT_FAILURE);
     }
 
-    // check if I set the correct size of memory (= total_size)
-    if(ftruncate(memsh, total_size) == -1){
-        perror("ftruncate error");
-        exit(EXIT_FAILURE);
-    }
-
-    sharedBuf = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, memsh, 0);
-
-    if(sharedBuf == MAP_FAILED){
-        perror("Mmap failed");
-        exit(EXIT_FAILURE);
-    }
-
-    sharedBuf->head = 0;
-    sharedBuf->tail = 0;
-    sharedBuf->height = height;
-    sharedBuf->width = width;
-    sharedBuf->frame_size = frame_size;
-    if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG){
-        strcpy(sharedBuf->format, "MJPG");
-    }else if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV){
-        strcpy(sharedBuf->format, "YUYV");
-    }
-    sem_init(&sharedBuf->mutex, 1, 1);
-    sem_init(&sharedBuf->data_avail, 1, 0);
-    sem_init(&sharedBuf->room_avail, 1, BUFFER_SIZE);
-
-    printf("Shared memory created with frame size = %d bytes\n", frame_size);
+    printf("Message queue created \n");
 
     // set the structure for the request
     memset(&req, 0, sizeof(req));               // set to 0 the structure
     req.count = BUFFER_DIM;                     // set the number of buffers
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;     // set the type of buffer (video capture)
-    req.memory = V4L2_MEMORY_MMAP;              // set the memory type (mmap, direct access in memory)
+    req.memory = V4L2_MEMORY_MMAP;              // set the memory type (mmap)
 
     // check if the request is accepted
     if(ioctl(vd, VIDIOC_REQBUFS, &req) == -1){
         perror("VIDIOC_REQBUFS error");
+        cleanup();
         exit(EXIT_FAILURE);
     }
 
@@ -350,12 +369,13 @@ int main(int argc, char **argv){
 
         memset(&buf, 0, sizeof(buf));               // set to 0 the structure
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;     // set the type of buffer (video capture)
-        buf.memory = V4L2_MEMORY_MMAP;              // set the memory type (mmap, direct access in memory)
+        buf.memory = V4L2_MEMORY_MMAP;              // set the memory type (mmap)
         buf.index = i;                              // set the index of the buffer
 
         // check if the buffer is accepted
         if(ioctl(vd, VIDIOC_QUERYBUF, &buf) == -1){
             perror("VIDIOC_QUERYBUF error");
+            cleanup();
             exit(EXIT_FAILURE);
         }
 
@@ -363,6 +383,7 @@ int main(int argc, char **argv){
         buffer_ptrs[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, vd, buf.m.offset);
         if(buffer_ptrs[i] == MAP_FAILED){
             perror("MMAP failure");
+            cleanup();
             exit(EXIT_FAILURE);
         }
 
@@ -371,43 +392,22 @@ int main(int argc, char **argv){
         // enqueue the buffer
         if(ioctl(vd, VIDIOC_QBUF, &buf) == -1){
             perror("VIDIOC_QBUF error");
+            cleanup();
             exit(EXIT_FAILURE);
         }
     }
 
     printf("Configuration of the buffers completed\n");
 
-    // memory map for ending condition
-    fin = shm_open(SHARED_FINISHED_CONDITION, O_CREAT | O_RDWR, 0666);
-
-    if(fin == -1){
-        perror("Shared memory creation failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // check if I set the correct size of memory (= total_size)
-    if(ftruncate(fin, sizeof(finish_t)) == -1){
-        perror("ftruncate error");
-        exit(EXIT_FAILURE);
-    }
-
-    sharedFin = mmap(NULL, sizeof(finish_t), PROT_READ | PROT_WRITE, MAP_SHARED, fin, 0);
-
-    // check if I create the shared memory
-    if(sharedFin == MAP_FAILED){
-        perror("Mmap failed");
-        exit(EXIT_FAILURE);
-    }
-
-    sharedFin->finish = 0;
-    sem_init(&sharedFin->mutex, 1, 1);
-
     // start the producer and consumer
+    printf("Start acquisition\n");
+    
     pid_t pid;
     pid = fork();
 
     if(pid < 0){
         perror("fork error");
+        cleanup();
         exit(EXIT_FAILURE);
     }
     if(pid == 0){
@@ -415,29 +415,14 @@ int main(int argc, char **argv){
         exit(0);
     }
     
-    frame_producer();
+    frame_producer(frame_size, type);
 
     // wait the consumer
     waitpid(pid, NULL, 0);
     printf("End acquisition\n");
 
-    // free the memory
-    munmap(sharedBuf, total_size);
-    shm_unlink(SHARED_MEMORY_NAME);
-    close(memsh);
-    munmap(sharedFin, sizeof(finish_t));
-    shm_unlink(SHARED_FINISHED_CONDITION);
-    close(fin);
-
-    // close the streaming
-    for(int i = 0; i < BUFFER_DIM; i++){
-        munmap(buffer_ptrs[i], buffer_lengths[i]);
-    }
-    printf("Free memory\n");
-
-    // close the device (videocamera)
-    close(vd);
-    printf("Close the videocamera\n");
+    // free memory and close the device (videocamera)
+    cleanup();
     
     return 0;
 }
