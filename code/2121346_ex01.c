@@ -76,6 +76,7 @@ void cleanup() {
  * @return
  */
 void convert_yuyv_to_rgb(unsigned char *frame, int width, int height, FILE *frame_file) {
+    
     // Write PPM header
     fprintf(frame_file, "P6\n%d %d\n255\n", width, height);
 
@@ -86,6 +87,13 @@ void convert_yuyv_to_rgb(unsigned char *frame, int width, int height, FILE *fram
         unsigned char y1 = frame[i + 2];
         unsigned char v = frame[i + 3];
 
+        /**
+         * Conversion formula:
+         * R = Y + 1.402 * (V - 128)
+         * G = Y - 0.344136 * (U - 128) - 0.714136 * (V - 128)
+         * B = Y + 1.772 * (U - 128)
+         */
+
         int r0 = y0 + 1.402 * (v - 128);
         int g0 = y0 - 0.344136 * (u - 128) - 0.714136 * (v - 128);
         int b0 = y0 + 1.772 * (u - 128);
@@ -94,6 +102,7 @@ void convert_yuyv_to_rgb(unsigned char *frame, int width, int height, FILE *fram
         int g1 = y1 - 0.344136 * (u - 128) - 0.714136 * (v - 128);
         int b1 = y1 + 1.772 * (u - 128);
 
+        // value clipping (range 0-255)
         r0 = r0 > 255 ? 255 : (r0 < 0 ? 0 : r0);
         g0 = g0 > 255 ? 255 : (g0 < 0 ? 0 : g0);
         b0 = b0 > 255 ? 255 : (b0 < 0 ? 0 : b0);
@@ -154,7 +163,6 @@ static void frame_consumer(){
         // save the frame in the disk (folder frame)
         if (strncmp(msg.type, "YUYV", 4) == 0) {
             sprintf(filename, "frame/frame_%d.ppm", frame_numb);        // save the frame in .ppm
-
             FILE *frame_file = fopen(filename, "wb");
             if (frame_file) {
                 convert_yuyv_to_rgb(frame, msg.width, msg.height, frame_file);
@@ -182,6 +190,8 @@ static void frame_consumer(){
 
 /**
  * @brief Function that produces a frame and sends it to the consumer
+ * @param width width of the frame
+ * @param height height of the frame
  * @param frame_size size of the frame
  * @param type type of the frame (MJPG or YUYV)
  * @return
@@ -227,7 +237,7 @@ static void frame_producer(int width, int height, int frame_size, char frtype[5]
             continue;
         }
 
-        // check if I set the correct size of memory (= total_size)
+        // check if I set the correct size of memory
         if(ftruncate(memsh, frame_size) == -1){
             perror("ftruncate error");
             cleanup();
@@ -246,6 +256,8 @@ static void frame_producer(int width, int height, int frame_size, char frtype[5]
 
         // copy the frame into the memory map
         memcpy(mmap_frame, buffer_ptrs[buf.index], frame_size);
+
+        // set the message
         msg.width = width;
         msg.height = height;
         msg.frame_size = frame_size;
@@ -290,7 +302,7 @@ static void frame_producer(int width, int height, int frame_size, char frtype[5]
  * @param argv array of arguments
  */
 int main(int argc, char **argv){
-    int status, memsh, fin;
+
     int frame_size, height, width;
     char type [5];
     
@@ -300,7 +312,8 @@ int main(int argc, char **argv){
     struct v4l2_requestbuffers req;         // request buffer structure
     struct v4l2_buffer buf;                 // buffer structure
 
-    if(argc == 1){ 
+    // check the number of arguments
+    if(argc == 1 || argc < 6){ 
         printf(usage_string, argv[0]); 
         exit(EXIT_FAILURE);
     }
@@ -404,6 +417,7 @@ int main(int argc, char **argv){
     // definition of the message
     msgId = msgget(IPC_PRIVATE, 0666);
 
+    // check if the message queue is created
     if(msgId == -1){
         perror("Error creating the message queue");
         cleanup();
@@ -460,7 +474,7 @@ int main(int argc, char **argv){
 
     printf("Configuration of the buffers completed\n");
 
-    // start the producer and consumer
+    // start the producer and the consumer
     printf("Start acquisition\n");
     
     pid_t pid;
