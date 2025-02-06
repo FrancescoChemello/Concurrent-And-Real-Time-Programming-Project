@@ -29,6 +29,8 @@
 
 struct msgframe{
     long mtype;                 // message type (required for message queue)
+    int width;                  // width of the frame
+    int height;                 // height of the frame
     int frame_size;             // size of the frame
     char type[5];               // the type (MJPG or YUYV) or EOFT (End OF Transmission)
     char shm_name[50];          // memory map name
@@ -62,6 +64,51 @@ void cleanup() {
     // Remove the message queue
     if (msgId != -1) {
         msgctl(msgId, IPC_RMID, NULL);
+    }
+}
+
+/**
+ * @brief Function that converts YUYV to RGB
+ * @param frame pointer to the frame
+ * @param width width of the frame
+ * @param height height of the frame
+ * @param frame_file pointer to the file
+ * @return
+ */
+void convert_yuyv_to_rgb(unsigned char *frame, int width, int height, FILE *frame_file) {
+    // Write PPM header
+    fprintf(frame_file, "P6\n%d %d\n255\n", width, height);
+
+    // Convert YUYV to RGB and write to file
+    for (int i = 0; i < width * height * 2; i += 4) {
+        unsigned char y0 = frame[i];
+        unsigned char u = frame[i + 1];
+        unsigned char y1 = frame[i + 2];
+        unsigned char v = frame[i + 3];
+
+        int r0 = y0 + 1.402 * (v - 128);
+        int g0 = y0 - 0.344136 * (u - 128) - 0.714136 * (v - 128);
+        int b0 = y0 + 1.772 * (u - 128);
+
+        int r1 = y1 + 1.402 * (v - 128);
+        int g1 = y1 - 0.344136 * (u - 128) - 0.714136 * (v - 128);
+        int b1 = y1 + 1.772 * (u - 128);
+
+        r0 = r0 > 255 ? 255 : (r0 < 0 ? 0 : r0);
+        g0 = g0 > 255 ? 255 : (g0 < 0 ? 0 : g0);
+        b0 = b0 > 255 ? 255 : (b0 < 0 ? 0 : b0);
+
+        r1 = r1 > 255 ? 255 : (r1 < 0 ? 0 : r1);
+        g1 = g1 > 255 ? 255 : (g1 < 0 ? 0 : g1);
+        b1 = b1 > 255 ? 255 : (b1 < 0 ? 0 : b1);
+
+        fputc(r0, frame_file);
+        fputc(g0, frame_file);
+        fputc(b0, frame_file);
+
+        fputc(r1, frame_file);
+        fputc(g1, frame_file);
+        fputc(b1, frame_file);
     }
 }
 
@@ -105,17 +152,25 @@ static void frame_consumer(){
         }
 
         // save the frame in the disk (folder frame)
-        if(strncmp(msg.type, "YUYV", 4) == 0){
-            sprintf(filename, "frame/frame_%d.raw", frame_numb);        // save the frame in .raw
-        }else{
+        if (strncmp(msg.type, "YUYV", 4) == 0) {
+            sprintf(filename, "frame/frame_%d.ppm", frame_numb);        // save the frame in .ppm
+
+            FILE *frame_file = fopen(filename, "wb");
+            if (frame_file) {
+                convert_yuyv_to_rgb(frame, msg.width, msg.height, frame_file);
+                fclose(frame_file);
+            } else {
+                perror("Error saving the frame\n");
+            }
+        } else {
             sprintf(filename, "frame/frame_%d.jpg", frame_numb);        // save the frame in .jpg
-        }
-        FILE * frame_file = fopen(filename, "wb");
-        if(frame_file){
-            fwrite(frame, 1, msg.frame_size, frame_file);
-            fclose(frame_file);
-        }else{
-            perror("Error saving the frame\n");
+            FILE *frame_file = fopen(filename, "wb");
+            if (frame_file) {
+                fwrite(frame, 1, msg.frame_size, frame_file);
+                fclose(frame_file);
+            } else {
+                perror("Error saving the frame\n");
+            }
         }
         frame_numb++;
 
@@ -131,7 +186,7 @@ static void frame_consumer(){
  * @param type type of the frame (MJPG or YUYV)
  * @return
  */
-static void frame_producer(int frame_size, char frtype[5]){   
+static void frame_producer(int width, int height, int frame_size, char frtype[5]){   
 
     struct v4l2_buffer buf;     // buffer structure
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -191,6 +246,8 @@ static void frame_producer(int frame_size, char frtype[5]){
 
         // copy the frame into the memory map
         memcpy(mmap_frame, buffer_ptrs[buf.index], frame_size);
+        msg.width = width;
+        msg.height = height;
         msg.frame_size = frame_size;
         strncpy(msg.type, frtype, sizeof(msg.type));
 
@@ -219,6 +276,8 @@ static void frame_producer(int frame_size, char frtype[5]){
 
     // send the end of transmission message
     strcpy(msg.type, "EOFT");
+    msg.width = 0;
+    msg.height = 0;
     msg.frame_size = 0;
     msgsnd(msgId, &msg, sizeof(msg) - sizeof(long), 0);
 
@@ -310,6 +369,8 @@ int main(int argc, char **argv){
         (fmt.fmt.pix.pixelformat >> 24) & 0xFF,
         fmt.fmt.pix.width, fmt.fmt.pix.height);
 
+    width = fmt.fmt.pix.width;
+    height = fmt.fmt.pix.height;
     frame_size = (unsigned int)fmt.fmt.pix.sizeimage;
     
     // setting frame rate
@@ -415,7 +476,7 @@ int main(int argc, char **argv){
         exit(0);
     }
     
-    frame_producer(frame_size, type);
+    frame_producer(width, height, frame_size, type);
 
     // wait the consumer
     waitpid(pid, NULL, 0);
